@@ -1,0 +1,51 @@
+# PlatformIO
+.pio
+.pioenvs
+.piolibdeps
+lib_deps.txt
+*.elf
+*.bin
+*.hex
+*.map
+
+# VSCode
+.vscode/
+!.vscode/extensions.json
+
+# Build / dependencies
+build/
+dist/
+node_modules/
+
+# Logs and temporary files
+*.log
+*.tmp
+*.bak
+*.swp
+*.swo
+*~
+
+# Environment / secrets
+.env
+.env.local
+*.local
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+.Spotlight-V100
+.Trashes
+
+# Windows
+Thumbs.db
+Thumbs.db:encryptable
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# Linux
+*~
+.directory
+.Trash-*
