@@ -7,6 +7,8 @@
 // circleAmount: Max falling objects allowed (default 8)
 // starAmount: Background stars (default 20)
 // fireDelay: Milliseconds between shots (default 200)
+// maxLives: Consecutive misses allowed before game over (default 3).
+//           Hitting a circle refills lives, so misses must be back-to-back.
 // Difficulty scaling: Score 0-100 increases active circles from 3→8 and speeds scale up
 //===================================
 
@@ -17,7 +19,8 @@
 //  - 10k pot A0
 //  - buzzer/speaker D8
 //
-// note: EEPROM code had to be commented.. not supported
+// note: EEPROM (persistent high score) is gated behind the USE_EEPROM build
+//       flag in platformio.ini -- not all boards support it (e.g. XIAO SAMD21)
 // note: auto-shutoff is ignored
 //
 // tested on XIAO SAM21, XIAO ESP32S3
@@ -28,19 +31,29 @@
 //  was trying to see if I can run I2C faster than default.
 //
 
+#include <Arduino.h>
 #include <Wire.h>
+#include <SPI.h>
 #include <Adafruit_GFX.h>
 //#include <Adafruit_SSD1306.h>
 #include <Adafruit_SH110X.h>
 
 // some MCUs (like SAMD21) do not have separate eeprom
-//#include <EEPROM.h>
+#ifdef USE_EEPROM
+#include <EEPROM.h>
+#endif
 #include <math.h>
+
+#include "pins.h"
 
 const uint8_t SCREEN_WIDTH = 128;
 const uint8_t SCREEN_HEIGHT = 64;
 //Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
+#ifdef USE_SPI_DISPLAY
+Adafruit_SH1106G display = Adafruit_SH1106G(SCREEN_WIDTH, SCREEN_HEIGHT, &SPI, DISPLAY_DC_PIN, DISPLAY_RST_PIN, DISPLAY_CS_PIN);
+#else
 Adafruit_SH1106G display = Adafruit_SH1106G(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
+#endif
 
 #define I2C_ADDRESS 0x3C //initialize with the I2C addr 0x3C (try 0x3D if display is blank)
 
@@ -48,16 +61,121 @@ Adafruit_SH1106G display = Adafruit_SH1106G(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, 
 #define SSD1306_WHITE SH110X_WHITE
 
 const bool isPotInverted = false;  // default is false!
-const uint8_t flashPin = 10;
-
-const int potPin = A0;      // Pin connected to potentiometer wiper
-const int buttonPin1 = D7;  // Button for shooting
-const int buzzerPin = D8;   // Buzzer for sound effects
-const int controlPin = D3;  // Pin for Auto-shutoff functionality - NOTUSED!
 const uint8_t EEPROM_SIZE = 16;  // Increased from 8
 
+// Forward declarations (Arduino IDE auto-generates these; PlatformIO's .cpp build does not)
+int readPotValue();
+#ifdef SERIAL_DEBUG_CONTROLS
+void handleSerialDebugInput();
+#endif
+void checkButtonState();
+void updateGunPosition();
+void generateBullet();
+void updateBullets(float deltaTime);
+void updateCircles(float deltaTime);
+void generateCircles();
+void generateStars();
+void generateMountains();
+void checkCollisions();
+void drawExplosion(int x, int y, int radius);
+void drawHeart(int cx, int cy);
+void updateAndDrawExplosions();
+void drawGame();
+void drawStars();
+void drawMountains();
+void writeIntIntoEEPROM(int address, int number);
+int readIntFromEEPROM(int address);
+void setIgnoreInputForDuration(unsigned long duration);
+void updateIgnoreInputTimer();
+void UpdateMenuScreenAfterInputAllowed();
+void InitializeHighScore();
+void UpdateHighScore();
+void ResetHighScore();
+void TitleScreenSequence();
+void gameOverSequence();
+void ResetScoresSequence();
+void resetGame();
+
+#ifdef SERIAL_DEBUG_CONTROLS
+// Simulated pot reading, driven by arrow keys / a,d over Serial (see handleSerialDebugInput)
+int debugPotValue = 511;
+// Fine step for a single tap; step ramps up toward the max while a direction
+// is held (i.e. repeated key events arrive faster than debugRepeatWindow),
+// so short taps give precise control and holding the key still crosses the
+// screen quickly.
+const int debugPotStepMin = 12;
+const int debugPotStepMax = 140;
+const int debugPotStepRamp = 10;
+const unsigned long debugRepeatWindow = 150;  // ms; faster than this = "held"
+int debugPotStep = debugPotStepMin;
+unsigned long lastDebugMoveTime = 0;
+int8_t lastDebugDirection = 0;  // -1 left, +1 right, 0 = none yet
+// Set for one checkButtonState() cycle to simulate a physical button press+release
+bool debugFirePulse = false;
+
+// Advances debugPotValue by one step in the given direction (-1 or +1),
+// accelerating the step size on rapid repeats and resetting it on a fresh
+// tap or direction change.
+void applyDebugMove(int8_t direction) {
+  unsigned long now = millis();
+  if (direction == lastDebugDirection && (now - lastDebugMoveTime) < debugRepeatWindow) {
+    debugPotStep = min(debugPotStep + debugPotStepRamp, debugPotStepMax);
+  } else {
+    debugPotStep = debugPotStepMin;
+  }
+  lastDebugDirection = direction;
+  lastDebugMoveTime = now;
+  debugPotValue = constrain(debugPotValue + direction * debugPotStep, 0, 1023);
+}
+
+// Reads bytes from Serial and updates debugPotValue / debugFirePulse.
+// Recognizes ANSI arrow-key escape sequences (ESC [ C / ESC [ D) as well as
+// plain 'a'/'d' as a fallback for terminals that don't forward arrow keys raw,
+// and 'f' to fire.
+void handleSerialDebugInput() {
+  static uint8_t escState = 0;  // 0 = idle, 1 = saw ESC, 2 = saw ESC [
+
+  while (Serial.available() > 0) {
+    int c = Serial.read();
+
+    if (escState == 1) {
+      escState = (c == '[') ? 2 : 0;
+      continue;
+    }
+    if (escState == 2) {
+      if (c == 'D') {  // left arrow
+        applyDebugMove(-1);
+        Serial.println("[debug] LEFT arrow");
+      } else if (c == 'C') {  // right arrow
+        applyDebugMove(1);
+        Serial.println("[debug] RIGHT arrow");
+      }
+      escState = 0;
+      continue;
+    }
+
+    if (c == 0x1B) {  // ESC
+      escState = 1;
+    } else if (c == 'a' || c == 'A') {
+      applyDebugMove(-1);
+      Serial.println("[debug] 'a' (left)");
+    } else if (c == 'd' || c == 'D') {
+      applyDebugMove(1);
+      Serial.println("[debug] 'd' (right)");
+    } else if (c == 'f' || c == 'F') {
+      debugFirePulse = true;
+      Serial.println("[debug] 'f' (fire)");
+    }
+  }
+}
+#endif
+
 int readPotValue() {
+#ifdef SERIAL_DEBUG_CONTROLS
+  int potValue = debugPotValue;
+#else
   int potValue = analogRead(potPin);
+#endif
 
   if (isPotInverted) {
     potValue = map(potValue, 0, 1023, 1023, 0);
@@ -66,14 +184,14 @@ int readPotValue() {
   return potValue;
 }
 
-// do these work on SAMD21? ESP32? no!
-// otherwise, #define USE_EEPROM 1 if the functionality is available for your board
-#if 0
+// enable with the USE_EEPROM build flag (platformio.ini) on boards that
+// support it (e.g. ESP32); not available on XIAO SAMD21
+#ifdef USE_EEPROM
 #define initEEPROM() EEPROM.begin(EEPROM_SIZE)
 #define commitEEPROM() EEPROM.commit()
 #else
-#define initEEPROM() ;
-#define commitEEPROM() ;
+#define initEEPROM()
+#define commitEEPROM()
 #endif
 
 unsigned int scoreCount = 0;  // Global variable to keep track of the number of points
@@ -204,6 +322,12 @@ Star stars[starAmount];  // Limited stars for background
 const uint8_t explosionAmount = 8;
 Explosion explosions[explosionAmount];  // Explosion effects
 uint8_t maxCirclesAllowed = 3;
+
+// Lives: player has maxLives, loses one each time a circle reaches the bottom.
+// A successful hit refills lives, so only 3 misses IN A ROW ends the game.
+const uint8_t maxLives = 3;
+uint8_t livesRemaining = maxLives;
+
 bool gameOver = true;
 uint8_t gameScreenState = 0;  //0 title screen -- 1 game -- 2 gameover -- 3 reset scores
 
@@ -214,7 +338,10 @@ const unsigned long fireDelay = 200;  // ms between shots (increased from 100)
 void setup() {
   Serial.begin(9600);                 // Start serial communication at 9600 baud rate
   Serial.println("Space Drop - Starting...");
-  
+#ifdef SERIAL_DEBUG_CONTROLS
+  Serial.println("SERIAL_DEBUG_CONTROLS enabled: Left/Right arrows (or a/d) to steer, f to fire.");
+#endif
+
   pinMode(buttonPin1, INPUT_PULLUP);  // Initialize shooting button pin as input with internal pull-up
   pinMode(potPin, INPUT);
   pinMode(buzzerPin, OUTPUT);
@@ -222,12 +349,17 @@ void setup() {
   digitalWrite(controlPin, HIGH);  // Ensure controlPin is HIGH on boot to keep the unit powered
   pinMode(flashPin, OUTPUT);
   digitalWrite(flashPin, LOW);
- 
+
+#ifdef USE_SPI_DISPLAY
+  // Initialize SPI (custom pins) before display
+  SPI.begin(DISPLAY_CLK_PIN, -1, DISPLAY_MOSI_PIN, DISPLAY_CS_PIN);
+#else
   // Initialize I2C before display
   Wire.begin();
   // go faster
   Wire.setClock(400000);  // argh, this is ignored by ESP32
-  
+#endif
+
   initEEPROM();
 
   InitializeHighScore();
@@ -262,13 +394,17 @@ const unsigned long buttonCheckInterval = 20;  // Check button every 20ms
 
 void loop() {
   unsigned long currentMillis = millis();
-  
+
+#ifdef SERIAL_DEBUG_CONTROLS
+  handleSerialDebugInput();
+#endif
+
   // Check button at a fixed interval (not every frame)
   if (currentMillis - lastButtonCheckTime >= buttonCheckInterval) {
     checkButtonState();
     lastButtonCheckTime = currentMillis;
   }
-  
+
   if (!gameOver) {
     uint32_t currentTime = micros();
     uint32_t deltaTimeMicros = currentTime - lastFrameTime;
@@ -278,25 +414,41 @@ void loop() {
     lastFrameTime = currentTime;
 
     updateGunPosition();
-    
+
     // Only fire on button press, not hold
     if (buttonPressed) {
       generateBullet();
       buttonPressed = false;  // Reset for next frame
     }
-    
+
     updateBullets(deltaTime);
     updateCircles(deltaTime);
     generateCircles();
     checkCollisions();
     drawGame();
-    
-    // Check for game over after updating circles
+
+    // A circle reaching the bottom is a "miss": lose a life. Game over only
+    // once all lives are gone (i.e. 3 misses in a row -- hits refill lives).
     for (int i = 0; i < circleAmount; i++) {
       if (circles[i].active && circles[i].y >= SCREEN_HEIGHT - circleRadius) {
-        gameOver = true;
-        gameOverSequence();
-        break;
+        circles[i].active = false;  // Clear the missed circle so play continues
+
+        if (livesRemaining > 0) {
+          livesRemaining--;
+        }
+        Serial.print("Missed a circle! Lives remaining: ");
+        Serial.println(livesRemaining);
+
+        if (livesRemaining == 0) {
+          gameOver = true;
+          gameOverSequence();
+          break;
+        }
+
+        // Audible feedback for a non-fatal miss
+        if (!crashSoundManager.isSequencePlaying) {
+          crashSoundManager.playSequence();
+        }
       }
     }
   }
@@ -305,7 +457,7 @@ void loop() {
   bulletSoundManager.updateSequence();
   crashSoundManager.updateSequence();
   updateIgnoreInputTimer();
-  
+
   // Reset buttonPressed flag after processing
   if (buttonPressed) {
     buttonPressed = false;
@@ -314,7 +466,16 @@ void loop() {
 
 void checkButtonState() {
   int currentButtonState = digitalRead(buttonPin1);
-  
+
+#ifdef SERIAL_DEBUG_CONTROLS
+  // Simulate a press for this one cycle; it'll read back HIGH (released) on
+  // the next cycle, giving the same press+release edges as a real button tap.
+  if (debugFirePulse) {
+    currentButtonState = LOW;
+    debugFirePulse = false;
+  }
+#endif
+
   // Detect button press (falling edge)
   if (currentButtonState == LOW && lastButtonState == HIGH) {
     buttonPressed = true;
@@ -322,19 +483,19 @@ void checkButtonState() {
     buttonTimer = millis();
     Serial.println("Button pressed");
   }
-  
+
   // Detect button release (rising edge)
   if (currentButtonState == HIGH && lastButtonState == LOW) {
     buttonActive = false;
     bool wasLongPress = longPressActive;
     longPressActive = false;
-    
+
     // Process button release for menu navigation
     if (!ignoreInput) {
       int tempPotValue = readPotValue();
       Serial.print("Button released. Game state: ");
       Serial.println(gameScreenState);
-      
+
       switch (gameScreenState) {
         case 0:  // title screen
           Serial.println("Starting game from title screen");
@@ -362,26 +523,26 @@ void checkButtonState() {
           break;
       }
     }
-    
+
     inactivityTimer = millis(); // Reset inactivity timer
   }
-  
+
   // Check for long press while button is held
   if (currentButtonState == LOW && buttonActive) {
     if (millis() - buttonTimer > longPressTime && !longPressActive) {
       longPressActive = true;
       Serial.println("Long press detected");
     }
-    
+
     // Check for shutoff press
     if (millis() - buttonTimer > shutoffPressTime) {
       digitalWrite(controlPin, LOW);
       Serial.println("Shutting down...");
     }
   }
-  
+
   lastButtonState = currentButtonState;
-  
+
   // Auto-shutoff after inactivity
   if (millis() - inactivityTimer > autoShutoffTime) {
     digitalWrite(controlPin, LOW);
@@ -391,14 +552,20 @@ void checkButtonState() {
 
 void updateGunPosition() {
   int potValue = readPotValue();
-  
+
   // Add some smoothing to reduce twitchiness
   static uint8_t smoothedGunX = SCREEN_WIDTH / 2;
   uint8_t targetX = map(potValue, 0, 1023, 0, SCREEN_WIDTH - gunWidth);
   targetX = max((uint8_t)0, min(targetX, (uint8_t)(SCREEN_WIDTH - gunWidth)));
-  
-  // Smooth movement (70% old position, 30% new position)
-  smoothedGunX = (smoothedGunX * 7 + targetX * 3) / 10;
+
+#ifdef SERIAL_DEBUG_CONTROLS
+  // Keyboard input already moves in discrete steps (see applyDebugMove);
+  // smoothing here would just add extra lag on top of that, so snap directly.
+  smoothedGunX = targetX;
+#else
+  // Smooth movement (40% old position, 60% new position) to tame analog pot noise
+  smoothedGunX = (smoothedGunX * 4 + targetX * 6) / 10;
+#endif
   gunX = smoothedGunX;
 }
 
@@ -407,20 +574,20 @@ void generateBullet() {
   if (millis() - lastFireTime < fireDelay) {
     return;  // Too soon to fire again
   }
-  
+
   lastFireTime = millis();
-  
+
   // Find an inactive bullet
   for (int i = 0; i < bulletAmount; i++) {
     if (!bullets[i].active) {
       bullets[i].x = gunX + gunWidth / 2;
       bullets[i].y = gunY;
       bullets[i].active = true;
-      
+
       if (!bulletSoundManager.isSequencePlaying && !explosionSoundManager.isSequencePlaying) {
         bulletSoundManager.playSequence();
       }
-      
+
       Serial.println("Fired bullet");
       break;
     }
@@ -455,27 +622,27 @@ void updateCircles(float deltaTime) {
 void generateCircles() {
   float difficulty = (scoreCount < 100) ? (float)scoreCount / 100.0f : 1.0f;
   maxCirclesAllowed = 3 + (int)(difficulty * 5);
-  
+
   // Lower spawn rate to reduce twitchiness
   static unsigned long lastSpawnTime = 0;
-  const unsigned long minSpawnInterval = 300;  // ms between spawns
-  
+  const unsigned long minSpawnInterval = 2000;  // ms between spawns
+
   if (millis() - lastSpawnTime < minSpawnInterval) {
     return;
   }
-  
+
   for (int i = 0; i < maxCirclesAllowed; i++) {
     if (!circles[i].active) {
       if (random(0, 40) == 0) {  // Reduced spawn chance
         circles[i].x = random(6, SCREEN_WIDTH - 6);
         circles[i].y = 0;
         circles[i].active = true;
-        
+
         // Smoother difficulty scaling
-        float baseSpeed = 12.0f;
-        float maxSpeed = 28.0f;
+        float baseSpeed = 2.0f;
+        float maxSpeed = 14.0f;
         circles[i].speed = baseSpeed + difficulty * (maxSpeed - baseSpeed);
-        
+
         lastSpawnTime = millis();
         break;
       }
@@ -511,20 +678,21 @@ void checkCollisions() {
           float dx = bullets[i].x - circles[j].x;
           float dy = bullets[i].y - circles[j].y;
           float distance = sqrt(dx * dx + dy * dy);
-          
+
           if (distance < (circleRadius + 2)) {  // 2 = bullet radius
             bullets[i].active = false;
             drawExplosion(circles[j].x, circles[j].y, circleRadius);
             circles[j].active = false;
-            
+
             if (!explosionSoundManager.isSequencePlaying) {
               explosionSoundManager.playSequence();
             }
-            
+
             digitalWrite(flashPin, HIGH);
             delay(30); // Shorter flash
             digitalWrite(flashPin, LOW);
             scoreCount++;
+            livesRemaining = maxLives;  // A hit refills lives -> misses must be consecutive
             Serial.print("Score: ");
             Serial.println(scoreCount);
           }
@@ -547,18 +715,30 @@ void drawExplosion(int x, int y, int radius) {
   }
 }
 
+// Draws a small (~5px wide) filled heart. (cx, cy) is the center of the two
+// top lobes; the point extends a few pixels below.
+void drawHeart(int cx, int cy) {
+  display.fillCircle(cx - 1, cy, 1, SSD1306_WHITE);   // left lobe
+  display.fillCircle(cx + 1, cy, 1, SSD1306_WHITE);   // right lobe
+  display.fillTriangle(
+    cx - 2, cy + 1,
+    cx + 2, cy + 1,
+    cx,     cy + 3,
+    SSD1306_WHITE);                                    // bottom point
+}
+
 void updateAndDrawExplosions() {
   for (int i = 0; i < explosionAmount; i++) {
     if (explosions[i].active) {
       int x = explosions[i].x;
       int y = explosions[i].y;
       int explosionRadius = circleRadius * 3;
-      
+
       display.drawLine(x - explosionRadius, y, x + explosionRadius, y, SSD1306_WHITE);
       display.drawLine(x, y - explosionRadius, x, y + explosionRadius, SSD1306_WHITE);
       display.drawLine(x - explosionRadius / 1.414, y - explosionRadius / 1.414, x + explosionRadius / 1.414, y + explosionRadius / 1.414, SSD1306_WHITE);
       display.drawLine(x - explosionRadius / 1.414, y + explosionRadius / 1.414, x + explosionRadius / 1.414, y - explosionRadius / 1.414, SSD1306_WHITE);
-      
+
       explosions[i].framesLeft--;
       if (explosions[i].framesLeft == 0) {
         explosions[i].active = false;
@@ -577,6 +757,11 @@ void drawGame() {
 
   display.setCursor(60, 57);
   display.print(scoreCount);
+
+  // Draw remaining lives as small hearts in the top-left corner
+  for (int i = 0; i < livesRemaining; i++) {
+    drawHeart(4 + i * 8, 3);
+  }
 
   // Draw gun as a triangle
   display.drawTriangle(
@@ -613,7 +798,7 @@ void drawStars() {
 
 void drawMountains() {
   const uint8_t numPoints = sizeof(mountainPoints) / sizeof(mountainPoints[0]);
-  
+
   for (int i = 0; i < numPoints - 1; i++) {
     display.drawLine(
       mountainPoints[i][0], mountainPoints[i][1],
@@ -749,11 +934,11 @@ void TitleScreenSequence() {
 void gameOverSequence() {
   gameScreenState = 2;
   Serial.println("Game over sequence");
-  
+
   if (!crashSoundManager.isSequencePlaying) {
     crashSoundManager.playSequence();
   }
-  
+
   UpdateHighScore();
 
   display.clearDisplay();
@@ -790,9 +975,9 @@ void ResetScoresSequence() {
 
 void resetGame() {
   Serial.println("Resetting game...");
-  
+
   gameScreenState = 1;
-  
+
   for (int i = 0; i < bulletAmount; i++) {
     bullets[i].active = false;
   }
@@ -808,13 +993,14 @@ void resetGame() {
   gunX = SCREEN_WIDTH / 2;
   gameOver = false;
   scoreCount = 0;
-  
+  livesRemaining = maxLives;
+
   display.clearDisplay();
   display.display();
 
   generateMountains();
   generateStars();
-  
+
   inactivityTimer = millis(); // Reset inactivity timer
   lastFireTime = 0; // Reset fire timer
   Serial.println("Game reset complete - Ready to play!");

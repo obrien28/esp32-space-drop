@@ -26,13 +26,20 @@ OLED|128x64 pixels,I2C|1.3in
 
 ## Software Setup
 
-Add the sketch to your Arduino IDE.
+This project is built with [PlatformIO](https://platformio.org/) (VS Code extension or CLI).
 
-You may need to add the following libraries:
+1. Install PlatformIO.
+2. Open this folder as a PlatformIO project.
+3. Build and upload with the `seeed_xiao_esp32s3` environment (defined in [platformio.ini](platformio.ini)).
 
-- Adafruit_GFX_Library
-- Adafruit_SH110x
+Dependencies (Adafruit GFX Library, Adafruit SH110X, Adafruit BusIO) and the ESP32 board platform are declared in `platformio.ini` and installed automatically — no manual library or board manager setup required.
 
-Also, you may need to add the board profile for your particular board.
-The ESP32S3 board needs this library:
-- esp32 (by Espressif Systems, I installed v3.3.6)
+Source code lives in [src/main.cpp](src/main.cpp).
+
+### CLI usage
+
+```sh
+pio run              # build
+pio run -t upload    # build and flash
+pio device monitor    # serial monitor (9600 baud)
+```
